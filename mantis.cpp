@@ -692,6 +692,153 @@ void parallel_for(size_t begin, size_t end, F f) {
     }
 }
 
+// ============================= MANTIS ==================================
+struct ConvexCellV1 {
+
+    ConvexCellV1() = default;
+
+    //ConvexCellV1(const std::vector<glm::vec3>& pts, const std::vector<std::array<int, 4>>& quads) {
+    //    points.resize(pts.size());
+    //    for (size_t i = 0; i < pts.size(); ++i) {
+    //        points[i] = {pts[i].x, pts[i].y, pts[i].z};
+    //    }
+
+    //    std::map<std::pair<index_t, index_t>, std::pair<index_t, index_t>> edge_map;
+
+    //    for (size_t f = 0; f < quads.size(); ++f) {
+    //        auto q = quads[f];
+    //        for (size_t i = 0; i < 4; ++i) {
+    //            auto key = std::minmax(q[i], q[(i + 1) % 4]);
+    //            auto& p = edge_map[key];
+    //            if(key.first == q[i]) {
+    //                p.first = f;
+    //            } else {
+    //                p.second = f;
+    //            }
+    //        }
+    //    }
+
+    //    for(auto e: edge_map) {
+    //        edges.push_back(ConvexCellV1::Edge{e.first.first, e.first.second, e.second.first, e.second.second});
+    //    }
+
+    //    original_edges = edges;
+    //    num_faces = quads.size();
+    //    original_num_faces = num_faces;
+    //    original_num_vertices = points.size();
+    //}
+
+    struct Edge {
+        int from = -1, to = -1;
+        int left = -1, right = -1;
+    };
+
+    std::vector<GEO::vec3> points;
+
+    std::vector<Edge> edges;
+    std::vector<Edge> original_edges;
+
+    // temporary buffers
+    mutable std::vector<Edge> edge_buffer;
+    mutable std::vector<int> vertices_buffer;
+    mutable std::vector<double> distance;
+    mutable std::vector<int> label;
+
+    index_t num_faces = 0;
+    index_t original_num_faces = 0;
+    index_t original_num_vertices = 0;
+
+    void clip(GEO::vec4 plane) {
+        edge_buffer.clear();
+        vertices_buffer.clear();
+
+        distance.resize(points.size());
+        label.resize(points.size());
+
+        bool has_positive = false;
+        bool has_negative = false;
+
+        //vertices.resize(points.size());
+        //std::iota(vertices.begin(), vertices.end(), 0);
+
+        for (int v = 0; v < points.size(); ++v) {
+            double d = eval_plane(plane, points[v]);
+            has_positive |= d > 0;
+            has_negative |= d <= 0;
+            distance[v] = d;
+            label[v] = d > 0 ? 1 : -1;
+        }
+
+        if (!has_negative) {
+            //printf("no negative\n");
+            return;
+        }
+
+        if (!has_positive) {
+            // result is empty
+            edges.clear();
+            return;
+        }
+
+        for(int v = 0; v < points.size(); ++v) {
+            if(label[v] > 0) {
+                vertices_buffer.push_back(v);
+            }
+        }
+
+        std::vector<int> x_edge(num_faces, -1);
+        index_t new_face_idx = num_faces++;
+
+        auto try_make_edge = [&](int f, int v, bool is_from) {
+            if (x_edge[f] == -1) {
+                x_edge[f] = v;
+            } else {
+                Edge e{.left = new_face_idx, .right = f, .from = is_from ? x_edge[f] : v, .to = is_from ? v
+                                                                                                        : x_edge[f]};
+                edge_buffer.push_back(e);
+            }
+        };
+
+        for (Edge& edge : edges) {
+            int from = edge.from;
+            int to = edge.to;
+
+            double from_dist = distance[from];
+            double to_dist = distance[to];
+
+            int from_label = label[from];
+            int to_label = label[to];
+
+            if (from_label * to_label < 0) {
+                double t = from_dist / (from_dist - to_dist);
+                GEO::vec3 pt = points[from] + t * (points[to] - points[from]);
+                auto v = int(points.size());
+                points.push_back(pt);
+                bool is_from = from_label > 0;
+                if (from_label > 0) {
+                    edge.to = v;
+                } else {
+                    edge.from = v;
+                }
+                edge_buffer.push_back(edge);
+                try_make_edge(edge.left, v, is_from);
+                try_make_edge(edge.right, v, !is_from);
+            }
+            else if(from_label > 0 && to_label > 0) {
+                edge_buffer.push_back(edge);
+            }
+        }
+
+        std::swap(edges, edge_buffer);
+    }
+
+    void reset() {
+        edges = original_edges;
+        num_faces = original_num_faces;
+        points.resize(original_num_vertices);
+    }
+};
+
 // ============================= GEOMETRY UTILS ===============================
 
 GEO::vec4 to_vec4(GEO::vec3 v, double w) {
@@ -826,6 +973,146 @@ bool check_and_create_bounding_box(
 
     return is_intercepting;
 }
+
+// ============================= ConvexCell ===============================
+
+class DisjointSets
+{
+private:
+    std::vector<int> parent;
+    std::vector<int> rank;
+
+public:
+    explicit DisjointSets(int size)
+    {
+        parent.resize(size);
+        rank.resize(size, 0);
+
+        for (int i = 0; i < size; ++i)
+        {
+            parent[i] = i;
+        }
+    }
+
+    int find(int x)
+    {
+        if (parent[x] != x)
+        {
+            parent[x] = find(parent[x]); // Path compression
+        }
+        return parent[x];
+    }
+
+    void unionSets(int x, int y)
+    {
+        int xRoot = find(x);
+        int yRoot = find(y);
+
+        if (xRoot == yRoot)
+        {
+            return;
+        }
+
+        // Union by rank
+        if (rank[xRoot] < rank[yRoot])
+        {
+            parent[xRoot] = yRoot;
+        }
+        else if (rank[yRoot] < rank[xRoot])
+        {
+            parent[yRoot] = xRoot;
+        }
+        else
+        {
+            parent[yRoot] = xRoot;
+            rank[xRoot] = rank[xRoot] + 1;
+        }
+    }
+
+    int size() const { return parent.size(); }
+};
+
+
+struct ConvexCell {
+    std::vector<GEO::vec3> points;
+
+    struct Edge {
+        index_t left = -1, right = -1;
+        index_t from = -1, to = -1;
+    };
+
+    std::vector<Edge> edges;
+
+    // temporary buffers
+    std::vector<double> distance;
+    std::vector<int> sign;
+
+    index_t num_faces = 0;
+
+    void clip(GEO::vec4 plane) {
+        distance.resize(points.size());
+        sign.resize(points.size());
+
+        bool has_positive = false;
+        bool has_negative = false;
+        for (size_t i = 0; i < points.size(); ++i) {
+            double d = eval_plane(plane, points[i]);
+            has_positive |= d > 0;
+            has_negative |= d <= 0;
+            distance[i] = d;
+            sign[i] = d > 0 ? 1 : -1;
+        }
+
+        if(!has_positive || !has_negative) {
+            return;
+        }
+
+        make_consistent();
+
+        std::vector<index_t> x_edge(num_faces, -1);
+        index_t new_face_idx = num_faces++;
+
+        auto try_make_edge = [&](index_t f, index_t v, bool is_from){
+            if(x_edge[f] == -1) {
+                x_edge[f] = v;
+            }
+            else {
+               Edge e {.left = new_face_idx, .right = f, .from = is_from ? x_edge[f] : v, .to = is_from ? v : x_edge[f]};
+               edges.push_back(e);
+            }
+        };
+
+        for (size_t e = 0; e < edges.size(); ++e) {
+            index_t from = edges[e].from;
+            index_t to = edges[e].to;
+
+            double from_dist = distance[from];
+            double to_dist = distance[to];
+
+            int from_sign = sign[from];
+            int to_sign = sign[to];
+
+            if (from_sign * to_sign < 0) {
+                double t  = from_dist / (from_dist - to_dist);
+                GEO::vec3 pt = points[from] + t * (points[to] - points[from]);
+                auto v = points.size();
+                points.push_back(pt);
+                bool is_from = from_dist > 0;
+                if(from_dist > 0) {
+                    edges[e].to = v;
+                }
+                else {
+                    edges[e].from = v;
+                }
+                try_make_edge(edges[e].left, v, is_from);
+                try_make_edge(edges[e].right, v, !is_from);
+            }
+        }
+    }
+
+    void make_consistent() {
+    }
+};
 
 // ============================= DISTANCE TO MESH ===============================
 
@@ -1025,6 +1312,55 @@ Impl::Impl(const std::vector<GEO::vec3> &points, const std::vector<std::array<in
     compute_interception_list();
 }
 
+void convert(const GEO::ConvexCell& geoCell, ConvexCellV1& cell) {
+
+    auto find_other_common_vertex = [&](int t0, int t1, int v) {
+        for(int i = 0; i < 3; ++i) {
+            int v0 = geoCell.triangle_vertex(t0, i);
+            if(v0 == v) {
+                continue;
+            }
+            for(int j = 0; j < 3; ++j) {
+                int v1 = geoCell.triangle_vertex(t1, j);
+                if(v1 == v0) {
+                    return v0;
+                }
+            }
+        }
+
+        assert(false);
+        return -1;
+    };
+
+    std::vector<int> remap(geoCell.nb_t(), -1);
+
+    for (int v = 1; v < int(geoCell.nb_v()); ++v) {
+        auto t = int(geoCell.vertex_triangle(v));
+
+        // Happens if a clipping plane did not clip anything.
+        if (t == VBW::END_OF_LIST) {
+            continue;
+        }
+
+        do {
+            int lv = int(geoCell.triangle_find_vertex(t, v));
+            int last_t = t;
+            t = int(geoCell.triangle_adjacent(t, (lv + 1) % 3));
+            visited[t] = true;
+
+            if(t > last_t) {
+                int right_face = find_other_common_vertex(last_t, t, v);
+                cell.edges.push_back(ConvexCellV1::Edge{.from = last_t, .to = t, .left = v, .right = right_face});
+            }
+        } while (t != geoCell.vertex_triangle(v));
+    }
+
+    for(size_t i = 0; i < visited.size(); ++i) {
+        if(!visited[i]) {
+            cell.edges.push_back(ConvexCellV1::Edge{.from = i, .to = i, .left = -1, .right = -1});
+        }
+    }
+}
 
 // for each voronoi cell, check every face of the mesh if the vertex corresponding to the cell
 // "intercepts" the face. This means that after trimming the cell by the face's edge planes, it is
@@ -1085,10 +1421,12 @@ void Impl::compute_interception_list() {
 #endif
 
     std::vector<GEO::ConvexCell> voronoi_cells(nb_points);
+    std::vector<ConvexCellV1> voronoi_cells_new(nb_points);
 
     for (index_t v = 0; v < nb_points; ++v) {
         delaunay->copy_Laguerre_cell_from_Delaunay(v, voronoi_cells[v], W);
         voronoi_cells[v].compute_geometry();
+        convert(voronoi_cells[v], voronoi_cells_new[v]);
     }
 
     std::vector<std::vector<index_t>> face_vertex(nb_faces);

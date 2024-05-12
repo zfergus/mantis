@@ -11,4 +11,4 @@ target_link_libraries(utils INTERFACE polyscope)
 
 add_subdirectory(wos)
 add_subdirectory(sdf)
-#add_subdirectory(debugger)
+add_subdirectory(debugger)
